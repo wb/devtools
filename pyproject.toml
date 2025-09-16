@@ -1,0 +1,32 @@
+# pyproject.toml
+[build-system]
+requires = ["setuptools>=67", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "devtools-lark"
+version = "0.1.0"
+description = "Small developer utilities. Includes 'softserve' (tiny static server with TOML config) and 'flatpack' (flatten Git repos into a single text stream)."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [{ name = "Walter Lark" }]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "License :: OSI Approved :: MIT License",
+  "Environment :: Console",
+  "Topic :: Internet :: WWW/HTTP",
+  "Topic :: Software Development :: Build Tools",
+]
+
+[project.urls]
+Homepage = "https://github.com/wb/devtools"
+Issues = "https://github.com/wb/devtools/issues"
+
+[project.scripts]
+softserve = "devtools.softserve:main"
+serve = "devtools.softserve:main" # alias for softserve
+flatpack = "devtools.flatpack:main"
