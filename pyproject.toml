@@ -21,6 +21,9 @@ classifiers = [
   "Topic :: Internet :: WWW/HTTP",
   "Topic :: Software Development :: Build Tools",
 ]
+dependencies = [
+  "pathspec>=0.12,<1.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/wb/devtools"
@@ -30,3 +33,16 @@ Issues = "https://github.com/wb/devtools/issues"
 softserve = "devtools.softserve:main"
 serve = "devtools.softserve:main" # alias for softserve
 flatpack = "devtools.flatpack:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q --basetemp=./.pytest_tmp"
+testpaths = ["tests"]
+markers = [
+  "integration: marks tests as integration (deselect with '-m \"not integration\"')",
+  "slow: may take longer or require git/network",
+]

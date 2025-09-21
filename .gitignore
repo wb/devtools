@@ -13,6 +13,7 @@ __pycache__/
 *.pyd
 .venv/
 .env
+.pytest_tmp/
 
 # Packaging / build
 build/

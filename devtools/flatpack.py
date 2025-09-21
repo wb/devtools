@@ -48,8 +48,11 @@ import hashlib
 import os
 import subprocess
 import sys
-from fnmatch import fnmatch
 from typing import List, Optional, Tuple, Dict, Any
+
+# Third-party: pathspec implements Git's gitignore "gitwildmatch" semantics.
+import pathspec
+from pathspec.patterns.gitwildmatch import GitWildMatchPattern
 
 SEP_BEGIN = "===== BEGIN FILE ====="
 SEP_CONTENT = "----- CONTENT -----"
@@ -58,6 +61,7 @@ TREE_BEGIN = "===== REPO TREE ====="
 TREE_END = "===== END TREE ====="
 
 REDACT_FILE_NAME = ".flatpackredact"
+
 
 # ------- git helpers -------
 
@@ -82,6 +86,33 @@ def git_ls_untracked(repo_root: str) -> List[str]:
         sys.exit(1)
     parts = out.split(b"\x00")
     return [p.decode("utf-8", "surrogateescape") for p in parts if p]
+
+def git_ls_submodules(repo_root: str) -> List[str]:
+    """
+    Return paths of submodules (gitlinks) in the index.
+    We parse `git ls-files --stage` for entries with mode 160000.
+    """
+    try:
+        out = subprocess.check_output(
+            ["git", "ls-files", "--stage", "-z"],
+            cwd=repo_root
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: git ls-files --stage failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    items = [p for p in out.split(b"\x00") if p]
+    paths: List[str] = []
+    for rec in items:
+        # rec format (NUL-separated): b"{mode} {sha}\t{path}"
+        try:
+            meta, path = rec.split(b"\t", 1)
+            mode = meta.split(b" ", 1)[0]
+            if mode == b"160000":
+                paths.append(path.decode("utf-8", "surrogateescape"))
+        except Exception:
+            continue
+    return paths
+
 
 # ------- io/utility -------
 
@@ -126,15 +157,20 @@ def sha256_file(path: str) -> str:
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
-# ------- redact rules (.flatpackredact) -------
+def _normalize_path(p: str) -> str:
+    # Remove literal "./" prefixes only; do NOT strip leading dots.
+    while p.startswith("./"):
+        p = p[2:]
+    return p
 
-Rule = Tuple[str, str]  # ("redact"|"unredact", pattern)
 
-def load_redact_rules(repo_root: str) -> Tuple[List[Rule], Optional[str]]:
+# ------- redact rules (.flatpackredact via pathspec) -------
+
+def load_redact_lines(repo_root: str) -> Tuple[List[str], Optional[str]]:
     """
-    Load .flatpackredact from repo_root (if present).
-    Returns (rules, hex_hash_or_None).
-    Rules are ordered; each is ("redact"|"unredact", pattern).
+    Load .flatpackredact lines (from repo root only).
+    Returns (lines, sha256_hex_or_None).
+    Comments (# ...) and blank lines are skipped. Raw patterns (including leading '!') are preserved.
     """
     path = os.path.join(repo_root, REDACT_FILE_NAME)
     if not os.path.isfile(path):
@@ -145,95 +181,45 @@ def load_redact_rules(repo_root: str) -> Tuple[List[Rule], Optional[str]]:
         print(f"WARN: cannot read {REDACT_FILE_NAME}: {e}", file=sys.stderr)
         return [], None
 
-    rules: List[Rule] = []
+    lines: List[str] = []
     for line in raw.decode("utf-8", "replace").splitlines():
         s = line.strip()
         if not s or s.startswith("#"):
             continue
-        if s.startswith("!"):
-            pat = s[1:].strip()
-            if pat:
-                rules.append(("unredact", pat))
-            continue
-        rules.append(("redact", s))
-    return rules, sha256_bytes(raw)
+        lines.append(s)
+    return lines, sha256_bytes(raw)
 
-def _normalize_path(p: str) -> str:
-    # Remove literal "./" prefixes only; do NOT strip leading dots.
-    while p.startswith("./"):
-        p = p[2:]
-    return p
+def compile_gitwild_patterns(lines: List[str]) -> List[GitWildMatchPattern]:
+    """Compile redact lines into GitWildMatchPattern objects (order preserved)."""
+    return [GitWildMatchPattern(p) for p in lines]
 
-def _match_gitignore_style(rel_path: str, pattern: str) -> bool:
+def decide_redaction(rel_path: str, pats: List[GitWildMatchPattern]) -> Tuple[bool, str]:
     """
-    Approximate gitignore semantics:
+    Apply patterns in order (gitignore semantics): last match wins.
+    Returns (redact, reason) where reason is "glob:<pattern>" or "negate:!<pattern>" or "-".
 
-    - Leading '/'  ⇒ root-anchored.
-    - Trailing '/' ⇒ directory rule (match any file under that directory).
-    - No '/' in pattern ⇒ also test against the basename.
-    - '/dir' behaves like '/dir/' (root-anchored directory match).
-    - '**' works via fnmatch.
-
-    Not a full reimplementation of gitignore, but covers common cases.
+    Note on mapping to redaction:
+      - For GitWildMatchPattern, `include == True` means a normal ignore rule (no '!').
+        We treat "ignored" as **redacted** -> (True, "glob:<pattern>").
+      - `include == False` means a negated rule ('!…').
+        We treat negation as **unredact** -> (False, "negate:!<core>").
     """
     rel_path = _normalize_path(rel_path)
-    basename = rel_path.rsplit("/", 1)[-1]
-
-    # Flags from the raw pattern
-    root_anchored = pattern.startswith("/")
-    dir_only = pattern.endswith("/")
-
-    # Core pattern without leading/trailing slashes used only for flags
-    pat = pattern.rstrip("/")
-    if root_anchored:
-        pat = pat[1:]  # remove leading '/'
-
-    # Helper: does the pattern contain any glob chars?
-    has_glob = any(ch in pat for ch in "*?[]")
-
-    if root_anchored:
-        # Root-anchored directory:
-        # Treat "/dir" the same as "/dir/" when there's no glob and no further slash.
-        if dir_only or (not has_glob and "/" not in pat):
-            # match the directory itself or anything under it
-            return rel_path == pat or rel_path.startswith(pat + "/")
-
-        # Otherwise, match against the full relative path from the repo root
-        return fnmatch(rel_path, pat)
-
-    # Unanchored patterns
-
-    if dir_only:
-        # Directory rule like "foo/" (no leading slash):
-        # match if any path segment equals 'foo' and we are inside it.
-        # Quick check: segment "/foo/" appears somewhere in "/<rel_path>"
-        seg = "/" + pat + "/"
-        return seg in ("/" + rel_path)
-
-    # Non-directory, unanchored:
-    if "/" in pat:
-        # Has a slash ⇒ test against full relative path
-        return fnmatch(rel_path, pat)
+    last: Optional[Tuple[bool, str]] = None  # (include_flag, pattern_text)
+    for p in pats:
+        if p.match_file(rel_path):
+            last = (p.include, p.pattern)
+    if last is None:
+        return False, "-"
+    include, pat_text = last
+    if include:
+        # Normal ignore rule => redact
+        return True, f"glob:{pat_text}"
     else:
-        # No slash ⇒ test against basename (gitignore style) OR full path
-        return fnmatch(basename, pat) or fnmatch(rel_path, pat)
+        # Negated rule => unredact; ensure reason uses a single leading '!'
+        core = pat_text.lstrip("!")
+        return False, f"negate:!{core}"
 
-def decide_redaction(rel_path: str, rules: List[Rule]) -> Tuple[bool, str]:
-    """
-    Apply rules in order; last match wins.
-    Returns (redact, reason) where reason = "glob:<pattern>" or "-" if none matched.
-    """
-    state: Optional[bool] = None
-    reason: str = "-"
-    for action, pat in rules:
-        if _match_gitignore_style(rel_path, pat):
-            if action == "redact":
-                state = True
-                reason = f"glob:{pat}"
-            else:
-                state = False
-                reason = f"negate:!{pat}"
-    return (state is True), (reason if state is not None else "-")
 
 # ------- tree building/rendering -------
 
@@ -277,15 +263,19 @@ def render_tree(node: Dict[str, Any], outfh, prefix: str = "") -> None:
             fname = e["path"].split("/")[-1]
             outfh.write(f"{prefix}{branch}{fname} {tag} {status} ({human_size(e['size'])})\n")
 
+
 # ------- core routines -------
 
-def collect_entries(repo_root: str, include_untracked: bool, rules: List[Rule]) -> Tuple[List[Dict[str, Any]], int, int]:
+def collect_entries(repo_root: str, include_untracked: bool, pats: List[GitWildMatchPattern]) -> Tuple[List[Dict[str, Any]], int, int]:
     tracked = set(git_ls_tracked(repo_root))
+    submods = set(git_ls_submodules(repo_root))  # gitlinks present in the index
     files = set(tracked)
     untracked = set()
     if include_untracked:
         untracked = set(git_ls_untracked(repo_root))
         files.update(untracked)
+    # Ensure submodule paths are represented even though they aren't regular files
+    files.update(submods)
     files = sorted(files)
 
     entries: List[Dict[str, Any]] = []
@@ -294,6 +284,21 @@ def collect_entries(repo_root: str, include_untracked: bool, rules: List[Rule]) 
 
     for rel in files:
         abs_path = os.path.join(repo_root, rel)
+
+        # Special-case: submodule gitlinks are directories on disk; include them
+        if rel in submods:
+            is_tracked = True
+            tracked_count += 1
+            redact, reason = decide_redaction(rel, pats)
+            entries.append({
+                "path": rel,
+                "tracked": is_tracked,
+                "size": 0,
+                "redact": redact,
+                "reason": reason,
+            })
+            continue
+
         if not os.path.isfile(abs_path):
             continue
         try:
@@ -308,7 +313,7 @@ def collect_entries(repo_root: str, include_untracked: bool, rules: List[Rule]) 
         else:
             untracked_count += 1
 
-        redact, reason = decide_redaction(rel, rules)
+        redact, reason = decide_redaction(rel, pats)
 
         entries.append({
             "path": rel,
@@ -339,8 +344,12 @@ def write_tree_and_header(outfh, repo_root: str, entries: List[Dict[str, Any]],
 def dump_repo(output_path: Optional[str],
               repo_root: str,
               include_untracked: bool) -> None:
+    # Strictly designed for Git repos (fail fast if not in a repo)
+    repo_root = validate_repo_root(repo_root)
+
     # Load redact rules
-    rules, redact_hash = load_redact_rules(repo_root)
+    lines, redact_hash = load_redact_lines(repo_root)
+    pats = compile_gitwild_patterns(lines) if lines else []
 
     # Open destination
     close_when_done = False
@@ -355,7 +364,7 @@ def dump_repo(output_path: Optional[str],
             pass
 
     # Build entries
-    entries, tracked_count, untracked_count = collect_entries(repo_root, include_untracked, rules)
+    entries, tracked_count, untracked_count = collect_entries(repo_root, include_untracked, pats)
 
     # TREE + header
     write_tree_and_header(outfh, repo_root, entries, tracked_count, untracked_count, redact_hash, include_untracked)
@@ -415,11 +424,16 @@ def dump_repo(output_path: Optional[str],
     if close_when_done:
         outfh.close()
 
+
 # ------- plan subcommand -------
 
 def run_plan(repo_root: str, include_untracked: bool) -> int:
-    rules, redact_hash = load_redact_rules(repo_root)
-    entries, tracked_count, untracked_count = collect_entries(repo_root, include_untracked, rules)
+    # Strictly designed for Git repos
+    repo_root = validate_repo_root(repo_root)
+
+    lines, redact_hash = load_redact_lines(repo_root)
+    pats = compile_gitwild_patterns(lines) if lines else []
+    entries, tracked_count, untracked_count = collect_entries(repo_root, include_untracked, pats)
 
     # Print tree + header (same as dump, but no file bodies)
     outfh = sys.stdout
@@ -440,12 +454,15 @@ def run_plan(repo_root: str, include_untracked: bool) -> int:
             outfh.write(f"[include] {e['path']}\n")
     return 0
 
+
 # ------- arg parsing / main -------
 
 def validate_repo_root(path: str) -> str:
     """
     Return the absolute path to the Git repo's top-level directory.
     Works even if 'path' is a subdirectory inside the repo.
+
+    This tool is **strictly** for Git repos: we fail fast if not in a repo.
     """
     if not os.path.isdir(path):
         print(f"ERROR: {path} is not a directory.", file=sys.stderr)
