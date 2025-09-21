@@ -3,8 +3,8 @@
 Small developer utilities.
 
 - [Installation](#installation)
-- [softserve](#softserve)
 - [flatpack](#flatpack)
+- [softserve](#softserve)
 
 _Requires Python 3.11+_
 
@@ -27,6 +27,61 @@ make uninstall
 ```
 
 This installs the tools into your `PATH`: `softserve`, `serve` (alias), and `flatpack`.
+
+---
+
+## flatpack
+
+Flatten a Git repo into a single text file with a tree header — ideal
+for sharing with LLMs.
+
+### Quick start
+
+```bash
+flatpack --repo . -o dump.txt
+# or just pipe to your terminal
+flatpack
+# or to your clipboard
+flatpack | pbcopy
+```
+
+### Defaults
+
+- Includes tracked **and** untracked files (respects `.gitignore`).
+- Redaction is controlled only by a root `.flatpackredact` file (gitignore-style).
+- SHA-256 hashes are always included per file.
+- Auto-detects repo root and works from any subfolder.
+
+### Redaction rules
+
+Flatpack looks for a single `.flatpackredact` file at the **repo root**.  
+It uses [gitignore-style patterns](https://git-scm.com/docs/gitignore) (last match wins, `!` negates).  
+
+Examples:
+
+```gitignore
+# redact all Markdown
+*.md
+
+# redact everything under devtools/
+devtools/
+
+# redact root file only
+/.flatpackredact
+
+# but keep README.md even if other rules match
+!README.md
+```
+
+### Plan mode
+
+Use `plan` to preview decisions without writing file bodies:
+
+```bash
+flatpack plan
+```
+
+This prints the tree, redact file hash, and a list of `[include]` / `[redact:…]` decisions.
 
 ---
 
@@ -85,41 +140,6 @@ Output looks like:
   Local:   http://localhost:8000/
   Network: http://192.168.1.41:8000/
 (Ctrl+C to stop)
-```
-
----
-
-## flatpack
-
-Flatten a Git repo into a single text file with a tree header --- ideal
-for sharing with LLMs.
-
-### Quick start
-
-```bash
-flatpack --repo . -o dump.txt
-# or just pipe to your terminal
-flatpack
-# or to your clipboard
-flatpack | pbcopy
-```
-
-### Defaults
-
--   Includes tracked **and** untracked files (respects `.gitignore`).
--   Redacts image contents (keeps metadata).
--   Adds a SHA-256 per file (disable with `--no-hash`).
--   Auto-detects repo root and works from any subfolder.
-
-### Common options
-
-``` bash
-flatpack --exclude "secrets/**" "dist/**"        # drop from scope entirely
-flatpack --exclude-ext .pem .key                 # drop by extension
-flatpack --redact "config/*.json"                # keep file metadata, hide body
-flatpack --redact-ext .pdf .zip                  # redact by extension
-flatpack --max-bytes 100000                      # redact files over 100 KB
-flatpack --exclude-untracked                     # only tracked files
 ```
 
 ---

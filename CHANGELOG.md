@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **flatpack** redesign:
+  - Redaction is now driven **only by a root `.flatpackredact`** file (gitignore-style). There is no automatic redaction anymore.
+  - SHA-256 file hashes are always included (`Hash:` line always present).
+  - A new `plan` subcommand (`flatpack plan`) prints the repo tree, the redact file hash, and a per-file decision list (`[include]` / `[redact:…]`), without emitting file bodies or encodings.
+  - `--include-untracked` now defaults to `true` (still respects `.gitignore`). Works the same for `plan`.
+
+### Added
+- **`.flatpackredact`** supports gitignore-style matching:
+  - Last match wins; `!pattern` unredacts.
+  - Leading `/` anchors to the repo root (e.g., `/.flatpackredact`).
+  - Trailing `/` targets directories (e.g., `devtools/`).
+  - Patterns without `/` match both basenames and paths (e.g., `*.md`).
+  - `**` wildcards are supported.
+- The output header now includes:
+  - `Redact-File: .flatpackredact (found|absent)`
+  - `Redact-File-Hash: sha256:<hex|->`
+  - A `Resolved:` block with `include_untracked = true|false`.
+
+### Removed (**breaking**)
+- Deprecated CLI flags removed in favor of `.flatpackredact`:
+  - `--no-hash`, `--redact`, `--redact-ext`, `--redact-images`, `--max-bytes`, `--exclude`, `--exclude-ext`.
+- Automatic image redaction (files like `*.png`, `*.jpg`, etc.) is no longer default. Add rules in `.flatpackredact` to restore this behavior.
+
+### Migration notes
+- Only the **root** `.flatpackredact` file is used. Files in subdirectories are ignored.
+- To hide the redact file itself, add `/.flatpackredact` to it.
+
 ## [0.1.0] - 2025-09-16
 
 ### Added

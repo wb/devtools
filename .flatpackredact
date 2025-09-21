@@ -1,0 +1,27 @@
+# Redact all common image formats
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.bmp
+*.ico
+*.tif
+*.tiff
+*.psd
+*.ai
+*.heic
+*.heif
+*.avif
+*.svg
+
+# Redact common audio formats
+*.mp3
+*.wav
+*.flac
+*.aac
+*.ogg
+*.wma
+*.m4a
+*.aiff
+*.alac

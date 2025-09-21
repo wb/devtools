@@ -6,10 +6,10 @@ Scope vs. Redaction:
 - Scope decides which files appear at all (tree + metadata).
 - Redaction hides bodies but keeps metadata.
 
-Defaults:
-- Includes tracked AND untracked files in scope.
-- Redacts image bodies (keeps their metadata).
-- Includes a SHA-256 hash per file (disable with --no-hash).
+Defaults (no config file required):
+- Includes tracked AND untracked files in scope (untracked respects .gitignore).
+- No automatic redaction (unless a `.flatpackredact` file is present).
+- Includes a SHA-256 hash per file (always on).
 - Writes to STDOUT if -o/--output is not provided.
 - Tree header is always printed first.
 
@@ -22,6 +22,11 @@ Legend: [T]=tracked [U]=untracked [inc]=included [redact:<reason>]=redacted
 <tree lines>
 ===== END TREE =====
 
+Redact-File: .flatpackredact (found|absent)
+Redact-File-Hash: sha256:<hex|-> 
+Resolved:
+  include_untracked = true|false
+
 ===== BEGIN FILE =====
 Path: <relative/path>
 Mode: text|binary
@@ -29,7 +34,7 @@ Encoding: utf-8|base64
 Size: <bytes>
 Redacted: yes|no
 Redact-Reason: <reason or ->
-Hash: sha256:<hex> | -
+Hash: sha256:<hex>
 ----- CONTENT -----
 <file content or empty if redacted>
 ===== END FILE =====
@@ -52,11 +57,7 @@ SEP_END = "===== END FILE ====="
 TREE_BEGIN = "===== REPO TREE ====="
 TREE_END = "===== END TREE ====="
 
-# Common image extensions (lowercase, with leading dot)
-IMAGE_EXTS = {
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico",
-    ".tif", ".tiff", ".psd", ".ai", ".heic", ".heif", ".avif", ".svg"
-}
+REDACT_FILE_NAME = ".flatpackredact"
 
 # ------- git helpers -------
 
@@ -95,9 +96,6 @@ def is_utf8_text(b: bytes) -> bool:
     except UnicodeDecodeError:
         return False
 
-def normalize_exts(exts: List[str]) -> set[str]:
-    return {e.lower() if e.startswith(".") else f".{e.lower()}" for e in exts}
-
 def human_size(n: int) -> str:
     units = ["B", "KB", "MB", "GB", "TB"]
     i = 0
@@ -125,46 +123,117 @@ def sha256_file(path: str) -> str:
             h.update(chunk)
     return h.hexdigest()
 
-# ------- redaction / filtering -------
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
-def should_redact(rel_path: str,
-                  size: int,
-                  redact_images: bool,
-                  redacted_exts: set[str],
-                  redact_globs: List[str],
-                  max_bytes: Optional[int],
-                  redact_all: bool) -> Tuple[bool, str]:
-    """Return (redact, reason)."""
-    if redact_all:
-        return True, "redact-all"
+# ------- redact rules (.flatpackredact) -------
 
-    ext = os.path.splitext(rel_path)[1].lower()
+Rule = Tuple[str, str]  # ("redact"|"unredact", pattern)
 
-    if redact_images and ext in IMAGE_EXTS:
-        return True, f"image-ext:{ext}"
+def load_redact_rules(repo_root: str) -> Tuple[List[Rule], Optional[str]]:
+    """
+    Load .flatpackredact from repo_root (if present).
+    Returns (rules, hex_hash_or_None).
+    Rules are ordered; each is ("redact"|"unredact", pattern).
+    """
+    path = os.path.join(repo_root, REDACT_FILE_NAME)
+    if not os.path.isfile(path):
+        return [], None
+    try:
+        raw = read_working_file(path)
+    except Exception as e:
+        print(f"WARN: cannot read {REDACT_FILE_NAME}: {e}", file=sys.stderr)
+        return [], None
 
-    if ext in redacted_exts:
-        return True, f"ext:{ext}"
+    rules: List[Rule] = []
+    for line in raw.decode("utf-8", "replace").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("!"):
+            pat = s[1:].strip()
+            if pat:
+                rules.append(("unredact", pat))
+            continue
+        rules.append(("redact", s))
+    return rules, sha256_bytes(raw)
 
-    for pat in redact_globs:
-        if fnmatch(rel_path, pat):
-            return True, f"glob:{pat}"
+def _normalize_path(p: str) -> str:
+    # Remove literal "./" prefixes only; do NOT strip leading dots.
+    while p.startswith("./"):
+        p = p[2:]
+    return p
 
-    if max_bytes is not None and size > max_bytes:
-        return True, f"max-bytes:{max_bytes}"
+def _match_gitignore_style(rel_path: str, pattern: str) -> bool:
+    """
+    Approximate gitignore semantics:
 
-    return False, "-"
+    - Leading '/'  ⇒ root-anchored.
+    - Trailing '/' ⇒ directory rule (match any file under that directory).
+    - No '/' in pattern ⇒ also test against the basename.
+    - '/dir' behaves like '/dir/' (root-anchored directory match).
+    - '**' works via fnmatch.
 
-def should_exclude(rel_path: str,
-                   excluded_exts: set[str],
-                   exclude_globs: List[str]) -> bool:
-    ext = os.path.splitext(rel_path)[1].lower()
-    if ext in excluded_exts:
-        return True
-    for pat in exclude_globs:
-        if fnmatch(rel_path, pat):
-            return True
-    return False
+    Not a full reimplementation of gitignore, but covers common cases.
+    """
+    rel_path = _normalize_path(rel_path)
+    basename = rel_path.rsplit("/", 1)[-1]
+
+    # Flags from the raw pattern
+    root_anchored = pattern.startswith("/")
+    dir_only = pattern.endswith("/")
+
+    # Core pattern without leading/trailing slashes used only for flags
+    pat = pattern.rstrip("/")
+    if root_anchored:
+        pat = pat[1:]  # remove leading '/'
+
+    # Helper: does the pattern contain any glob chars?
+    has_glob = any(ch in pat for ch in "*?[]")
+
+    if root_anchored:
+        # Root-anchored directory:
+        # Treat "/dir" the same as "/dir/" when there's no glob and no further slash.
+        if dir_only or (not has_glob and "/" not in pat):
+            # match the directory itself or anything under it
+            return rel_path == pat or rel_path.startswith(pat + "/")
+
+        # Otherwise, match against the full relative path from the repo root
+        return fnmatch(rel_path, pat)
+
+    # Unanchored patterns
+
+    if dir_only:
+        # Directory rule like "foo/" (no leading slash):
+        # match if any path segment equals 'foo' and we are inside it.
+        # Quick check: segment "/foo/" appears somewhere in "/<rel_path>"
+        seg = "/" + pat + "/"
+        return seg in ("/" + rel_path)
+
+    # Non-directory, unanchored:
+    if "/" in pat:
+        # Has a slash ⇒ test against full relative path
+        return fnmatch(rel_path, pat)
+    else:
+        # No slash ⇒ test against basename (gitignore style) OR full path
+        return fnmatch(basename, pat) or fnmatch(rel_path, pat)
+
+def decide_redaction(rel_path: str, rules: List[Rule]) -> Tuple[bool, str]:
+    """
+    Apply rules in order; last match wins.
+    Returns (redact, reason) where reason = "glob:<pattern>" or "-" if none matched.
+    """
+    state: Optional[bool] = None
+    reason: str = "-"
+    for action, pat in rules:
+        if _match_gitignore_style(rel_path, pat):
+            if action == "redact":
+                state = True
+                reason = f"glob:{pat}"
+            else:
+                state = False
+                reason = f"negate:!{pat}"
+    return (state is True), (reason if state is not None else "-")
 
 # ------- tree building/rendering -------
 
@@ -208,29 +277,70 @@ def render_tree(node: Dict[str, Any], outfh, prefix: str = "") -> None:
             fname = e["path"].split("/")[-1]
             outfh.write(f"{prefix}{branch}{fname} {tag} {status} ({human_size(e['size'])})\n")
 
-# ------- main flatten -------
+# ------- core routines -------
 
-def dump_repo(output_path: Optional[str],
-              repo_root: str,
-              exclude_untracked: bool,
-              redact_images: bool,
-              redact_exts: List[str],
-              redact_globs: List[str],
-              max_bytes: Optional[int],
-              redact_all: bool,
-              exclude_exts: List[str],
-              exclude_globs: List[str],
-              no_hash: bool) -> None:
+def collect_entries(repo_root: str, include_untracked: bool, rules: List[Rule]) -> Tuple[List[Dict[str, Any]], int, int]:
     tracked = set(git_ls_tracked(repo_root))
     files = set(tracked)
     untracked = set()
-    if not exclude_untracked:
+    if include_untracked:
         untracked = set(git_ls_untracked(repo_root))
         files.update(untracked)
     files = sorted(files)
 
-    redacted_exts = normalize_exts(redact_exts)
-    excluded_exts = normalize_exts(exclude_exts)
+    entries: List[Dict[str, Any]] = []
+    tracked_count = 0
+    untracked_count = 0
+
+    for rel in files:
+        abs_path = os.path.join(repo_root, rel)
+        if not os.path.isfile(abs_path):
+            continue
+        try:
+            size = os.path.getsize(abs_path)
+        except OSError as e:
+            print(f"WARN: cannot stat {rel}: {e}", file=sys.stderr)
+            continue
+
+        is_tracked = rel in tracked
+        if is_tracked:
+            tracked_count += 1
+        else:
+            untracked_count += 1
+
+        redact, reason = decide_redaction(rel, rules)
+
+        entries.append({
+            "path": rel,
+            "tracked": is_tracked,
+            "size": size,
+            "redact": redact,
+            "reason": reason,
+        })
+    return entries, tracked_count, untracked_count
+
+def write_tree_and_header(outfh, repo_root: str, entries: List[Dict[str, Any]],
+                          tracked_count: int, untracked_count: int,
+                          redact_hash: Optional[str], include_untracked: bool) -> None:
+    root_name = os.path.basename(os.path.abspath(repo_root.rstrip(os.sep))) or "/"
+    outfh.write(f"{TREE_BEGIN}\n")
+    outfh.write(f"Root: {root_name}\n")
+    outfh.write(f"Files: {len(entries)}   Tracked: {tracked_count}   Untracked: {untracked_count}\n")
+    outfh.write("Legend: [T]=tracked [U]=untracked [inc]=included [redact:<reason>]=redacted\n\n")
+    tree = build_tree_index(entries)
+    render_tree(tree, outfh)
+    outfh.write(f"{TREE_END}\n\n")
+
+    outfh.write(f"Redact-File: {REDACT_FILE_NAME} ({'found' if redact_hash else 'absent'})\n")
+    outfh.write(f"Redact-File-Hash: {'sha256:' + redact_hash if redact_hash else '-'}\n")
+    outfh.write("Resolved:\n")
+    outfh.write(f"  include_untracked = {'true' if include_untracked else 'false'}\n\n")
+
+def dump_repo(output_path: Optional[str],
+              repo_root: str,
+              include_untracked: bool) -> None:
+    # Load redact rules
+    rules, redact_hash = load_redact_rules(repo_root)
 
     # Open destination
     close_when_done = False
@@ -244,75 +354,24 @@ def dump_repo(output_path: Optional[str],
         except Exception:
             pass
 
-    # Pre-scan entries (stat + scope/exclude + redaction decision)
-    entries: List[Dict[str, Any]] = []
-    tracked_count = 0
-    untracked_count = 0
+    # Build entries
+    entries, tracked_count, untracked_count = collect_entries(repo_root, include_untracked, rules)
 
-    for rel in files:
-        abs_path = os.path.join(repo_root, rel)
-        if not os.path.isfile(abs_path):
-            continue
-
-        # Scope excludes first
-        if should_exclude(rel, excluded_exts, exclude_globs):
-            continue
-
-        try:
-            size = os.path.getsize(abs_path)
-        except OSError as e:
-            print(f"WARN: cannot stat {rel}: {e}", file=sys.stderr)
-            continue
-
-        is_tracked = rel in tracked
-        if is_tracked:
-            tracked_count += 1
-        else:
-            untracked_count += 1
-
-        redact, reason = should_redact(
-            rel_path=rel,
-            size=size,
-            redact_images=redact_images,
-            redacted_exts=redacted_exts,
-            redact_globs=redact_globs,
-            max_bytes=max_bytes,
-            redact_all=redact_all,
-        )
-
-        entries.append({
-            "path": rel,
-            "tracked": is_tracked,
-            "size": size,
-            "redact": redact,
-            "reason": reason,
-        })
-
-    # TREE HEADER (always)
-    root_name = os.path.basename(os.path.abspath(repo_root.rstrip(os.sep))) or "/"
-    outfh.write(f"{TREE_BEGIN}\n")
-    outfh.write(f"Root: {root_name}\n")
-    outfh.write(f"Files: {len(entries)}   Tracked: {tracked_count}   Untracked: {untracked_count}\n")
-    outfh.write("Legend: [T]=tracked [U]=untracked [inc]=included [redact:<reason>]=redacted\n\n")
-    tree = build_tree_index(entries)
-    render_tree(tree, outfh)
-    outfh.write(f"{TREE_END}\n\n")
+    # TREE + header
+    write_tree_and_header(outfh, repo_root, entries, tracked_count, untracked_count, redact_hash, include_untracked)
 
     # FILE BLOCKS
     for e in entries:
         rel = e["path"]
         abs_path = os.path.join(repo_root, rel)
 
-        # Compute hash (streaming) unless disabled
-        if no_hash:
+        # Always compute per-file hash (streaming)
+        try:
+            hexhash = sha256_file(abs_path)
+            hash_line = f"Hash: sha256:{hexhash}"
+        except Exception as ex:
+            print(f"WARN: cannot hash {rel}: {ex}", file=sys.stderr)
             hash_line = "Hash: -"
-        else:
-            try:
-                hexhash = sha256_file(abs_path)
-                hash_line = f"Hash: sha256:{hexhash}"
-            except Exception as ex:
-                print(f"WARN: cannot hash {rel}: {ex}", file=sys.stderr)
-                hash_line = "Hash: -"
 
         if e["redact"]:
             mode = "binary"   # conservative default when we don't read content
@@ -356,6 +415,33 @@ def dump_repo(output_path: Optional[str],
     if close_when_done:
         outfh.close()
 
+# ------- plan subcommand -------
+
+def run_plan(repo_root: str, include_untracked: bool) -> int:
+    rules, redact_hash = load_redact_rules(repo_root)
+    entries, tracked_count, untracked_count = collect_entries(repo_root, include_untracked, rules)
+
+    # Print tree + header (same as dump, but no file bodies)
+    outfh = sys.stdout
+    try:
+        outfh.reconfigure(encoding="utf-8", newline="\n")  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    write_tree_and_header(outfh, repo_root, entries, tracked_count, untracked_count, redact_hash, include_untracked)
+
+    # Decisions list
+    for e in entries:
+        if e["redact"]:
+            outfh.write(f"[redact:{e['reason']}] {e['path']}\n")
+        elif e["reason"].startswith("negate:!"):
+            outfh.write(f"[include:{e['reason']}] {e['path']}\n")
+        else:
+            outfh.write(f"[include] {e['path']}\n")
+    return 0
+
+# ------- arg parsing / main -------
+
 def validate_repo_root(path: str) -> str:
     """
     Return the absolute path to the Git repo's top-level directory.
@@ -376,52 +462,41 @@ def validate_repo_root(path: str) -> str:
         sys.exit(1)
     return os.path.abspath(top)
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        description="flatpack: flatten Git working files into a single text stream with a tree header (WIP-friendly)."
+        description="flatpack: flatten Git working files into a single text stream with a tree header."
     )
+    sub = ap.add_subparsers(dest="command", required=False)
+
+    # main dump command (default when no subcommand provided)
     ap.add_argument("--repo", default=".", help="Path to the Git repository (default: current directory)")
     ap.add_argument("-o", "--output", default=None, help="Output file path (default: STDOUT)")
+    ap.add_argument("--include-untracked", nargs="?", type=parse_bool, const=True, default=True,
+                    help="Include untracked files (respects .gitignore). Default: true. Use --include-untracked=false to disable.")
 
-    # Scope
-    ap.add_argument("--exclude-untracked", nargs="?", type=parse_bool, const=True, default=False,
-                    help="Exclude untracked files from scope (default: false = include untracked).")
-    ap.add_argument("--exclude", nargs="*", default=[],
-                    help="Glob patterns to EXCLUDE from scope entirely (e.g. 'secrets/**' 'dist/**').")
-    ap.add_argument("--exclude-ext", nargs="*", default=[],
-                    help="File extensions to EXCLUDE from scope (e.g. .pem .key).")
+    # plan subcommand
+    plan = sub.add_parser("plan", help="Preview redaction decisions (no file bodies, no hashing)")
+    plan.add_argument("--repo", default=".", help="Path to the Git repository (default: current directory)")
+    plan.add_argument("-o", "--output", default=None, help="(ignored)")
+    plan.add_argument("--include-untracked", nargs="?", type=parse_bool, const=True, default=True,
+                      help="Include untracked files (respects .gitignore). Default: true.")
 
-    # Redaction
-    ap.add_argument("--redact-images", nargs="?", type=parse_bool, const=True, default=True,
-                    help="Redact image contents (keep metadata). Default: true. Use --redact-images=false to include.")
-    ap.add_argument("--redact", nargs="*", default=[],
-                    help="Glob patterns to REDACT contents for (metadata only).")
-    ap.add_argument("--redact-ext", nargs="*", default=[],
-                    help="Extensions to REDACT contents for (e.g. .pdf .zip).")
-    ap.add_argument("--max-bytes", type=int, default=None,
-                    help="REDACT contents for files larger than this size in bytes.")
-    ap.add_argument("--redact-all", action="store_true",
-                    help="REDACT contents for EVERY file (tree + metadata only).")
+    return ap
 
-    # Hashing
-    ap.add_argument("--no-hash", action="store_true",
-                    help="Do not compute per-file SHA-256 hashes (Hash: -).")
-
+def main():
+    ap = build_parser()
     args = ap.parse_args()
-    repo_root = validate_repo_root(args.repo)
 
+    repo_root = validate_repo_root(getattr(args, "repo", "."))
+
+    if getattr(args, "command", None) == "plan":
+        raise SystemExit(run_plan(repo_root, include_untracked=args.include_untracked))
+
+    # default: dump
     dump_repo(
         output_path=args.output,
         repo_root=repo_root,
-        exclude_untracked=args.exclude_untracked,
-        redact_images=args.redact_images,
-        redact_exts=args.redact_ext,
-        redact_globs=args.redact,
-        max_bytes=args.max_bytes,
-        redact_all=args.redact_all,
-        exclude_exts=args.exclude_ext,
-        exclude_globs=args.exclude,
-        no_hash=args.no_hash,
+        include_untracked=args.include_untracked,
     )
 
     if args.output:
