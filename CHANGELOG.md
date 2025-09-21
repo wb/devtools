@@ -9,13 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **flatpack** redesign:
-  - Redaction is now driven **only by a root `.flatpackredact`** file (gitignore-style). There is no automatic redaction anymore.
+  - Redaction is now driven **only by a root `.flatpackredact`** file (gitignore-style, via pathspec). There is no automatic redaction anymore.
   - SHA-256 file hashes are always included (`Hash:` line always present).
   - A new `plan` subcommand (`flatpack plan`) prints the repo tree, the redact file hash, and a per-file decision list (`[include]` / `[redact:…]`), without emitting file bodies or encodings.
   - `--include-untracked` now defaults to `true` (still respects `.gitignore`). Works the same for `plan`.
+  - Submodules (gitlinks, mode 160000) are now detected and represented in the tree. They appear as tracked entries with `size=0` and no body output.
 
 ### Added
-- **`.flatpackredact`** supports gitignore-style matching:
+- **`.flatpackredact`** supports full gitignore-style matching:
   - Last match wins; `!pattern` unredacts.
   - Leading `/` anchors to the repo root (e.g., `/.flatpackredact`).
   - Trailing `/` targets directories (e.g., `devtools/`).
@@ -25,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `Redact-File: .flatpackredact (found|absent)`
   - `Redact-File-Hash: sha256:<hex|->`
   - A `Resolved:` block with `include_untracked = true|false`.
+- **Dev / CI tooling**:
+  - `pyproject.toml` declares `pathspec` as a dependency.
+  - New optional `dev` extras with pytest.
+  - Makefile targets for `test`, `test-all`, `test-integration`.
+  - Pytest configured to use `--basetemp=./.pytest_tmp` and mark `integration` tests.
 
 ### Removed (**breaking**)
 - Deprecated CLI flags removed in favor of `.flatpackredact`:
@@ -34,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Migration notes
 - Only the **root** `.flatpackredact` file is used. Files in subdirectories are ignored.
 - To hide the redact file itself, add `/.flatpackredact` to it.
+- Submodules are now surfaced in the tree view; if you previously relied on them being invisible, you may need to filter them out downstream.
 
 ## [0.1.0] - 2025-09-16
 
