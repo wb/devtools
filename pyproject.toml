@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "devtools-lark"
-version = "0.1.0"
+version = "0.2.0"
 description = "Small developer utilities. Includes 'softserve' (tiny static server with TOML config) and 'flatpack' (flatten Git repos into a single text stream)."
 readme = "README.md"
 license = { file = "LICENSE" }

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2025-09-21
+
 ### Changed
 - **flatpack** redesign:
   - Redaction is now driven **only by a root `.flatpackredact`** file (gitignore-style, via pathspec). There is no automatic redaction anymore.
@@ -59,5 +61,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Flexible exclude/redact options by glob or extension.
   - Auto-detects the repo root so it works from any subfolder.
 
-[Unreleased]: https://github.com/wb/devtools/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/wb/devtools/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/wb/devtools/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/wb/devtools/releases/tag/v0.1.0
